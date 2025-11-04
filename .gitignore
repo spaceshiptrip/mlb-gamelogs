@@ -69,3 +69,9 @@ Thumbs.db
 ehthumbs.db
 
 .gmap/
+
+# build/output
+*.xlsx
+~.xlsx
+*.zip
+.gmap/
