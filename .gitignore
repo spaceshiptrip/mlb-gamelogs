@@ -22,3 +22,19 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+
+# build/output
+*.xlsx
+~$*.xlsx
+*.zip
+
+# local tools
+.gmap/
+
+# keep folders tracked
+!reports/
+!reports/.gitkeep
+!proc_html/
+!proc_html/.gitkeep
+
