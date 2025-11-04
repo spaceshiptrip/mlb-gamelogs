@@ -1,474 +1,407 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-parse_atbats_to_excel.py
-Parses ESPN MLB Play-by-Play pages (live or saved HTML) and writes:
-  - AtBats sheet (one row per at-bat, with inning/half, description, pitch summary, and PITCHER)
-  - Pitches sheet (one row per pitch, with result/type/MPH and PITCHER)
-  - PitchingChanges sheet (detected "Pitching Change: A replaces B." events)
-Supports JS-rendered pages via Playwright (--render).
-"""
-
 import argparse
 import re
 import sys
 import time
-from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 
-from bs4 import BeautifulSoup
-from bs4.element import Tag
-
-# Optional imports resolved at runtime
-try:
-    import requests
-except Exception:
-    requests = None
-
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup, Tag
 
+# ----------------------------
+# Fetch / Render HTML
+# ----------------------------
 
-# ---------------------------
-# Utilities
-# ---------------------------
-
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
-
-PITCH_CHANGE_RX = re.compile(
-    r"(?:Pitching\s*Change|Pitching change)\s*:?\s*(?P<new>[^.,]+?)\s+replaces\s+(?P<old>[^.,]+)",
-    flags=re.IGNORECASE,
-)
-
-PITCHING_INLINE_RX = re.compile(
-    r"Pitching\s*:?\s*(?P<pitcher>[A-Za-z\.\-’' ]+)", flags=re.IGNORECASE
-)
-
-INNING_HEADER_RX = re.compile(
-    r"(Top|Bottom)\s+(\d+)(?:st|nd|rd|th)", flags=re.IGNORECASE
-)
-
-
-@dataclass
-class AtBatRow:
-    inning: int
-    half: str
-    team: str
-    description: str
-    pitch_count: int
-    pitch_sequence: str
-    header_id: str
-    body_id: str
-    pitcher: str
-
-
-@dataclass
-class PitchRow:
-    inning: int
-    half: str
-    team: str
-    description: str
-    pitch_no: Optional[int]
-    pitch_result: str
-    pitch_type: str
-    mph: Optional[int]
-    header_id: str
-    body_id: str
-    pitcher: str
-
-
-@dataclass
-class PitchChangeRow:
-    inning: int
-    half: str
-    new_pitcher: str
-    old_pitcher: str
-    description: str
-
-
-# ---------------------------
-# Fetching / Rendering
-# ---------------------------
-
-def render_with_playwright(url: str, quiet: bool = False, timeout_ms: int = 25000) -> str:
+def fetch_html(src: str, quiet: bool = False) -> str:
     """
-    Load URL with Playwright (Chromium), expand accordions, and return page HTML.
-    Requires: pip install playwright && playwright install chromium
+    If src looks like a URL, GET with headers; else treat as local file path.
     """
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as e:
-        raise RuntimeError(
-            "Playwright not available. Install with:\n"
-            "  pip install playwright\n  playwright install chromium"
-        ) from e
+    if re.match(r'^https?://', src.strip(), re.I):
+        if not quiet:
+            print(f"Fetching URL: {src}")
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        r = requests.get(src, headers=headers, timeout=30)
+        r.raise_for_status()
+        return r.text
+    else:
+        p = Path(src)
+        if not p.exists():
+            raise FileNotFoundError(src)
+        if not quiet:
+            print(f"Reading file: {src}")
+        return p.read_text(encoding="utf-8")
 
+def render_with_playwright(url: str, quiet: bool = False, wait_ms: int = 1500) -> str:
+    """
+    Render dynamic ESPN page to materialize collapsed pitch tables.
+    """
     if not quiet:
         print(f"Rendering URL (Playwright): {url}")
-
+    from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(user_agent=UA, viewport={"width": 1400, "height": 2000})
+        ctx = browser.new_context(user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ))
         page = ctx.new_page()
-        page.goto(url, timeout=timeout_ms)
-        # Wait for core container
-        page.wait_for_timeout(1500)
-
-        # Try to expand all at-bat accordions
-        # Buttons have class 'AtBatAccordion__header'
-        try:
-            buttons = page.query_selector_all("button.AtBatAccordion__header")
-            for b in buttons:
-                aria_expanded = (b.get_attribute("aria-expanded") or "").lower()
-                if aria_expanded != "true":
-                    b.click()
-            page.wait_for_timeout(800)
-        except Exception:
-            pass
-
+        page.goto(url, wait_until="domcontentloaded")
+        # Expand all accordions if present
+        page.wait_for_timeout(wait_ms)
+        # Click all accordion headers to ensure inner tables exist in DOM
+        headers = page.locator(".AtBatAccordion__header")
+        count = headers.count()
+        for i in range(count):
+            try:
+                btn = headers.nth(i)
+                aria = btn.get_attribute("aria-expanded") or ""
+                if aria.lower() != "true":
+                    btn.click()
+                    page.wait_for_timeout(50)
+            except Exception:
+                pass
+        page.wait_for_timeout(500)
         html = page.content()
         browser.close()
         return html
 
-
-def fetch_html(src: str, quiet: bool = False) -> str:
-    """
-    If src looks like a URL, fetch via requests (with UA). Otherwise read local file.
-    """
-    if src.startswith("http://") or src.startswith("https://"):
-        if requests is None:
-            raise RuntimeError("requests not available; cannot fetch URL. `pip install requests`")
-        if not quiet:
-            print(f"Fetching URL: {src}")
-        resp = requests.get(src, headers={"User-Agent": UA})
-        try:
-            resp.raise_for_status()
-        except Exception as e:
-            # ESPN may 403 without JS. Suggest using --render.
-            if resp.status_code == 403:
-                raise RuntimeError(
-                    "403 Forbidden fetching ESPN. Try using --render to let Playwright load JS."
-                ) from e
-            raise
-        return resp.text
-    else:
-        if not quiet:
-            print(f"Reading file: {src}")
-        with open(src, "r", encoding="utf-8") as f:
-            return f.read()
-
-
-# ---------------------------
+# ----------------------------
 # Parsing helpers
-# ---------------------------
+# ----------------------------
 
-def text_or_empty(node: Optional[Tag]) -> str:
-    return node.get_text(" ", strip=True) if node else ""
+def text_or_none(node: Optional[Tag]) -> str:
+    return node.get_text(strip=True) if node else ""
 
+def find_all_atbats(soup: BeautifulSoup) -> List[Tag]:
+    # ESPN uses <div class="AtBatAccordion"> per play
+    return list(soup.select("div.AtBatAccordion"))
 
-def get_inning_half_from_context(atbat_header: Tag) -> Tuple[int, str, str]:
+def parse_play_header(atbat_root: Tag) -> Tuple[str, Optional[int], Optional[int]]:
     """
-    Best-effort extraction of (inning_num, half, team_name) from nearby DOM.
-    Team is often not available inline; we return 'Unknown Team' if not found.
+    Return (description, away_score, home_score) from PlayHeader inside each AtBatAccordion.
     """
-    # Walk up to a reasonable container, then search backward for a header with inning info.
-    inning_num, half, team = 0, "Unknown", "Unknown Team"
-
-    # Try immediate parent/siblings for an inning label
-    cursor = atbat_header
-    for _ in range(8):  # bubble up a few levels
-        if not cursor or not isinstance(cursor, Tag):
-            break
-        # Look among previous siblings for recognizable headers
-        sib = cursor.previous_sibling
-        # Iterate backwards through siblings
-        while sib:
-            if isinstance(sib, Tag):
-                text = sib.get_text(" ", strip=True)
-                m = INNING_HEADER_RX.search(text or "")
-                if m:
-                    half = m.group(1).title()
-                    inning_num = int(m.group(2))
-                    # Team name is usually not in that header; keep Unknown Team
-                    return inning_num, half, team
-            sib = sib.previous_sibling
-        cursor = cursor.parent
-
-    # Fallback defaults
-    return inning_num, half, team
-
-
-def parse_pitch_rows_from_body(body_div: Tag) -> List[Tuple[Optional[int], str, str, Optional[int]]]:
-    """
-    From a .AtBatAccordion__body div, parse the inner PitchTable rows.
-    Returns list of (pitch_no, pitch_result, pitch_type, mph).
-    """
-    out = []
-    if not body_div:
-        return out
-
-    # Find the inner table
-    table = body_div.select_one("div.Table__Scroller table.Table")
-    if not table:
-        return out
-
-    tbody = table.find("tbody")
-    if not tbody:
-        return out
-
-    for tr in tbody.find_all("tr", recursive=False):
-        tds = tr.find_all("td", recursive=False)
-        if len(tds) < 3:
-            continue
-
-        # Col 0: has PitchCountIcon and a span with text like "Ball", "Foul Ball", "Single", etc.
-        pitch_no = None
-        pitch_result = ""
+    desc = ""
+    away = None
+    home = None
+    ph = atbat_root.select_one(".PlayHeader")
+    if ph:
+        d = ph.select_one(".PlayHeader__description")
+        desc = text_or_none(d)
+        a = ph.select_one(".PlayHeader__score--away")
+        h = ph.select_one(".PlayHeader__score--home")
         try:
-            icon = tds[0].select_one(".PitchCountIcon")
-            if icon and icon.get_text(strip=True).isdigit():
-                pitch_no = int(icon.get_text(strip=True))
-        except Exception:
-            pass
+            away = int(text_or_none(a)) if a else None
+        except ValueError:
+            away = None
+        try:
+            home = int(text_or_none(h)) if h else None
+        except ValueError:
+            home = None
+    return desc, away, home
 
-        # Result text (span next to icon)
-        result_span = tds[0].find("span")
-        if result_span:
-            pitch_result = result_span.get_text(strip=True)
-
-        # Col 1: pitch type
-        pitch_type = text_or_empty(tds[1])
-
-        # Col 2: mph (may be blank)
-        mph_txt = text_or_empty(tds[2])
-        mph_val = None
-        if mph_txt:
-            try:
-                mph_val = int(mph_txt)
-            except Exception:
-                mph_val = None
-
-        out.append((pitch_no, pitch_result, pitch_type, mph_val))
-
-    return out
-
-
-def detect_pitching_change(desc_text: str) -> Optional[Tuple[str, str]]:
+def find_inning_context(cursor: Tag) -> Tuple[str, str, str]:
     """
-    If description encodes a pitching change, return (new_pitcher, old_pitcher), else None.
+    Walk up then left to find inning & half & batting team in nearby headers.
+    Format returned inning as string number if possible; half in {'Top','Bottom','Mid','End'}.
+    Team may be 'Unknown Team' if not found.
     """
-    m = PITCH_CHANGE_RX.search(desc_text)
-    if m:
-        new_p = m.group("new").strip()
-        old_p = m.group("old").strip()
-        return new_p, old_p
-    return None
+    # Defaults
+    inning = "Unknown"
+    half = "Unknown"
+    team = "Unknown Team"
 
+    # Heuristic: look left (previous siblings) for containers with inning labels
+    ptr = cursor
+    for _ in range(3):  # climb a few levels
+        if not ptr:
+            break
+        sib = ptr.previous_sibling
+        hops = 0
+        while sib and hops < 30:
+            if isinstance(sib, Tag):
+                txt = sib.get_text(" ", strip=True)
+                if txt:
+                    # Examples: "Top 3rd", "Bottom 1st", "Mid 7th", etc.
+                    m = re.search(r'(?i)\b(Top|Bottom|Mid|End)\b\s+(\d+)(?:st|nd|rd|th)?', txt)
+                    if m:
+                        half = m.group(1).title()
+                        inning = m.group(2)
+                        # Try to find a team near this label
+                        tm = re.search(r'(?i)\bvs\b\s+([A-Za-z .-]+)$', txt)
+                        if tm:
+                            team = tm.group(1).strip()
+                        break
+                    # Another pattern some ESPN pages show inside headers:
+                    m2 = re.search(r'(?i)\b(Top|Bottom)\b.*?\bInning\b.*?(\d+)', txt)
+                    if m2:
+                        half = m2.group(1).title()
+                        inning = m2.group(2)
+                        break
+            sib = sib.previous_sibling
+            hops += 1
+        if inning != "Unknown":
+            break
+        ptr = ptr.parent if isinstance(ptr, Tag) else None
 
-def detect_inline_pitcher(desc_text: str) -> Optional[str]:
+    return inning, half, team
+
+PITCH_RESULT_MAP = {
+    "Strike Looking": "Strike Looking",
+    "Strike Swinging": "Strike Swinging",
+    "Foul Ball": "Foul Ball",
+    "Ball": "Ball",
+    "Hit By Pitch": "Hit By Pitch",
+    "Single": "Single",
+    "Double": "Double",
+    "Triple": "Triple",
+    "Home Run": "Home Run",
+    "Pop Out": "Pop Out",
+    "Fly Out": "Fly Out",
+    "Ground Out": "Ground Out",
+    "Batter Reached On Error - Batter To First": "Reached On Error",
+}
+
+def parse_pitch_table(body: Tag) -> List[Tuple[Optional[int], str, Optional[str], Optional[str]]]:
     """
-    Some sites include "Pitching: Name" inline. Try to pick it up.
+    Each row is (pitch_number, result_text, pitch_type, mph)
     """
-    m = PITCHING_INLINE_RX.search(desc_text)
-    if m:
-        return m.group("pitcher").strip()
-    return None
-
-
-# ---------------------------
-# Main parsing routine
-# ---------------------------
-
-def parse_play_by_play(html: str, verbose: bool = True) -> Tuple[List[AtBatRow], List[PitchRow], List[PitchChangeRow]]:
-    soup = BeautifulSoup(html, "lxml")
-
-    atbats: List[AtBatRow] = []
-    pitches: List[PitchRow] = []
-    changes: List[PitchChangeRow] = []
-
-    # Track current pitcher per half-inning: key = (inning, half)
-    current_pitcher: Dict[Tuple[int, str], str] = {}
-
-    # Find all at-bat blocks
-    atbat_blocks = soup.select("div.AtBatAccordion")
-    if verbose:
-        print(f"Found {len(atbat_blocks)} at-bats on the page.")
-
-    for idx, block in enumerate(atbat_blocks):
-        header = block.select_one("button.AtBatAccordion__header")
-        if not header:
+    rows = []
+    table = body.select_one("table.Table")
+    if not table:
+        return rows
+    for r in table.select("tbody.Table__TBODY > tr"):
+        # first cell holds count icon & label
+        pitch_no = None
+        result = ""
+        tds = r.select("td.Table__TD")
+        if not tds:
             continue
+        # Pitch number is in the little icon; result label is a sibling span
+        count_icon = tds[0].select_one(".PitchCountIcon")
+        if count_icon:
+            try:
+                pitch_no = int(count_icon.get_text(strip=True))
+            except ValueError:
+                pitch_no = None
+        label_span = tds[0].select_one("span")
+        result = text_or_none(label_span)
 
-        # Description (what happened in the play)
-        desc = text_or_empty(header.select_one(".PlayHeader__description"))
+        pitch_type = text_or_none(tds[1]) if len(tds) > 1 else None
+        mph = text_or_none(tds[2]) if len(tds) > 2 else None
+        mph = mph if mph else None
+        rows.append((pitch_no, result, pitch_type if pitch_type else None, mph))
+    return rows
 
-        # aria-controls gives us the body id containing the pitch table
-        body_id = header.get("aria-controls") or ""
-        body = None
-        if body_id:
-            body = block.find(id=body_id)
+# ---- Pitcher tracking ----
 
-        # Basic inning/half/team inference (best-effort)
-        inning, half, team = get_inning_half_from_context(header)
+PITCH_CHANGE_PATTERNS = [
+    # "Pitching Change: Yency Almonte replaces Jose Berríos."
+    re.compile(r'(?i)\bPitching Change:\s*([A-Z][a-zA-Z.\'-]+ [A-Z][a-zA-Z.\'-]+)\s+replaces\s+([A-Z][a-zA-Z.\'-]+ [A-Z][a-zA-Z.\'-]+)'),
+    # "X relieved by Y"
+    re.compile(r'(?i)\b([A-Z][a-zA-Z.\'-]+ [A-Z][a-zA-Z.\'-]+)\s+relieved by\s+([A-Z][a-zA-Z.\'-]+ [A-Z][a-zA-Z.\'-]+)'),
+    # "X replaces Y"
+    re.compile(r'(?i)\b([A-Z][a-zA-Z.\'-]+ [A-Z][a-zA-Z.\'-]+)\s+replaces\s+([A-Z][a-zA-Z.\'-]+ [A-Z][a-zA-Z.\'-]+)'),
+]
 
-        # Try to identify pitcher:
-        # 1) If description encodes a "Pitching Change", update state
-        # 2) Else if description includes "Pitching: X", seed the state
-        key = (inning, half)
-        new_pitcher_inline = detect_inline_pitcher(desc)
-        pc = detect_pitching_change(desc)
-        if pc:
-            new_p, old_p = pc
-            # Update the state immediately
-            current_pitcher[key] = new_p
-            changes.append(PitchChangeRow(inning=inning or 0, half=half, new_pitcher=new_p, old_pitcher=old_p, description=desc))
-            if verbose:
-                print(f"   • Pitching change detected: {old_p} → {new_p}")
-        elif new_pitcher_inline:
-            current_pitcher[key] = new_pitcher_inline
-            if verbose:
-                print(f"   • Detected pitcher inline: {new_pitcher_inline}")
+def detect_pitching_change(desc: str) -> Optional[str]:
+    """
+    Return the NEW pitcher name if a pitching change is described; else None.
+    """
+    for pat in PITCH_CHANGE_PATTERNS:
+        m = pat.search(desc)
+        if m:
+            # Prefer 'new' as first group if pattern is "Pitching Change: NEW replaces OLD"
+            # Otherwise infer new as the second group.
+            if 'Pitching Change' in pat.pattern:
+                return f"{m.group(1)}"
+            # for 'relieved by' or 'replaces'
+            return f"{m.group(2)}"
+    return None
 
-        # Current pitcher for this at-bat (may be empty if none detected yet for this half)
-        pitcher_for_ab = current_pitcher.get(key, "")
+def sniff_pitcher_from_context(atbat_root: Tag) -> Optional[str]:
+    """
+    Some pages show 'Pitching: Name' nearby. Search the at-bat cluster.
+    """
+    # 1) in PlayHeader or siblings?
+    txt = atbat_root.get_text(" ", strip=True)
+    m = re.search(r'(?i)\bPitching:\s*([A-Z][a-zA-Z.\'-]+ [A-Z][a-zA-Z.\'-]+)', txt)
+    if m:
+        return m.group(1).strip()
+    # 2) less reliable global match left here as fallback
+    return None
 
-        # Parse pitch table (if present)
-        pitch_rows = parse_pitch_rows_from_body(body) if body else []
+# ----------------------------
+# Main parse
+# ----------------------------
 
-        # Build pitch summary string like "P1: Ball, P2: Ball, ..."
-        if pitch_rows:
-            seq_parts = []
-            for (pno, pres, ptype, mph) in pitch_rows:
-                label = f"P{pno}" if pno is not None else "P?"
-                seq_parts.append(f"{label}: {pres}")
-            pitch_summary = " • " + ", ".join(seq_parts)
-        else:
-            pitch_summary = ""
+def parse_play_by_play(html: str, verbose: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    soup = BeautifulSoup(html, "html.parser")
+    atbats = find_all_atbats(soup)
+    if verbose:
+        print(f"Found {len(atbats)} at-bats on the page.")
+
+    atbat_rows = []
+    pitch_rows = []
+    summary_rows = []
+
+    # Track pitcher per half-inning (since changes reset with half)
+    current_pitcher_by_half: Dict[Tuple[str, str], Optional[str]] = {}
+
+    for idx, ab in enumerate(atbats, start=1):
+        desc, away_sc, home_sc = parse_play_header(ab)
+        body = ab.select_one(".AtBatAccordion__body")
+
+        inning, half, batting_team = find_inning_context(ab)
+        half_key = (inning, half)
+
+        # update pitcher if discoverable in this block
+        sniffed = sniff_pitcher_from_context(ab)
+        if sniffed:
+            current_pitcher_by_half[half_key] = sniffed
+
+        # If the description itself signals a change, update BEFORE recording this at-bat
+        new_pitcher = detect_pitching_change(desc)
+        if new_pitcher:
+            current_pitcher_by_half[half_key] = new_pitcher
+
+        pitcher = current_pitcher_by_half.get(half_key)
+
+        # Extract inner pitch table
+        inner = []
+        if body:
+            inner = parse_pitch_table(body)
 
         # Status output
         if verbose:
             inn_show = inning if inning else "Unknown Inning"
-            print(f"Parsing Inning {inn_show} ({half} – {team}): {desc}")
-            if pitch_rows:
-                joined = ", ".join([f"P{p[0] if p[0] is not None else '?'}: {p[1]}" for p in pitch_rows])
-                print(f"   • Captured {len(pitch_rows)} pitch rows → {joined}")
+            tm_show = batting_team if batting_team else "Unknown Team"
+            print(f"Parsing Inning {inn_show} ({half} – {tm_show}): {desc}")
+            if inner:
+                joined = ", ".join([f"P{p[0] if p[0] is not None else '?'}: {p[1]}" for p in inner])
+                print(f"   • Captured {len(inner)} pitch rows → {joined}")
             else:
-                print(f"   • Captured 0 pitch rows")
+                print("   • Captured 0 pitch rows")
 
-        # Create AtBatRow
-        atbats.append(
-            AtBatRow(
-                inning=inning or 0,
-                half=half,
-                team=team,
-                description=desc,
-                pitch_count=len(pitch_rows),
-                pitch_sequence=pitch_summary.replace(" • ", ""),
-                header_id=header.get("id") or "",
-                body_id=body_id,
-                pitcher=pitcher_for_ab,
-            )
-        )
+        # Record at-bat row
+        atbat_rows.append({
+            "seq": idx,
+            "inning": inning,
+            "half": half,
+            "batting_team": batting_team,
+            "description": desc,
+            "pitcher": pitcher if pitcher else "",
+            "away_score": away_sc,
+            "home_score": home_sc,
+            "pitch_count": len(inner)
+        })
 
-        # Create PitchRow entries
-        for (pno, pres, ptype, mph) in pitch_rows:
-            pitches.append(
-                PitchRow(
-                    inning=inning or 0,
-                    half=half,
-                    team=team,
-                    description=desc,
-                    pitch_no=pno,
-                    pitch_result=pres,
-                    pitch_type=ptype,
-                    mph=mph,
-                    header_id=header.get("id") or "",
-                    body_id=body_id,
-                    pitcher=pitcher_for_ab,
-                )
-            )
+        # Record pitch rows (one per pitch)
+        for pno, pres, ptype, mph in inner:
+            pitch_rows.append({
+                "atbat_seq": idx,
+                "inning": inning,
+                "half": half,
+                "batting_team": batting_team,
+                "pitcher": pitcher if pitcher else "",
+                "pitch_no": pno,
+                "result": pres,
+                "pitch_type": ptype,
+                "mph": mph,
+                "away_score": away_sc,
+                "home_score": home_sc,
+                "atbat_desc": desc
+            })
 
-        # Some sites encode pitching change as its own at-bat with no table; handled above.
-        # Also: if we encounter explicit "Pitching: X" with no change, we already seeded state.
+        # Keep a slim summary (for convenience)
+        if inner:
+            pitch_seq = " • ".join([f"P{p[0] if p[0] else '?'}: {p[1]}" for p in inner])
+        else:
+            pitch_seq = ""
+        summary_rows.append({
+            "seq": idx,
+            "inning": inning,
+            "half": half,
+            "batting_team": batting_team,
+            "pitcher": pitcher if pitcher else "",
+            "play": desc,
+            "pitch_sequence": pitch_seq,
+            "away_score": away_sc,
+            "home_score": home_sc
+        })
 
-    return atbats, pitches, changes
+        # If this AB is a pitching change with no batter action, continue; otherwise,
+        # also handle cases where the next AB should still carry the updated pitcher.
+        if new_pitcher and verbose:
+            print(f"   • Pitching change detected → current pitcher now: {new_pitcher}")
 
+    atbats_df = pd.DataFrame(atbat_rows)
+    pitches_df = pd.DataFrame(pitch_rows)
+    summary_df = pd.DataFrame(summary_rows)
+    return atbats_df, pitches_df, summary_df
 
-# ---------------------------
-# CLI / Excel output
-# ---------------------------
+# ----------------------------
+# CLI
+# ----------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Parse ESPN Play-by-Play at-bats & pitches → Excel.")
-    ap.add_argument("-i", "--input", help="URL or local HTML file", required=True)
-    ap.add_argument("-o", "--output", help="Output .xlsx path", default="out.xlsx")
-    ap.add_argument("--render", action="store_true", help="Use Playwright to render (JS) before parsing")
-    ap.add_argument("--save-html", help="If set, save the rendered/fetched HTML to this path")
-    ap.add_argument("--quiet", action="store_true", help="Minimal console output")
-
+    ap = argparse.ArgumentParser(description="Parse ESPN MLB Play-by-Play into Excel with At-Bats & Pitches.")
+    ap.add_argument("--input", "-i", required=True, help="URL to ESPN play-by-play or path to saved HTML.")
+    ap.add_argument("--output", "-o", default="espn_playbyplay.xlsx", help="Output Excel filename.")
+    ap.add_argument("--render", action="store_true", help="Use Playwright to render the page (dynamic).")
+    ap.add_argument("--quiet", action="store_true", help="Reduce console output.")
     args = ap.parse_args()
 
-    # Fetch/render
-    if args.render:
-        html = render_with_playwright(args.input, quiet=args.quiet)
+    src = args.input
+    if re.match(r'^https?://', src.strip(), re.I) and args.render:
+        html = render_with_playwright(src, quiet=args.quiet)
     else:
-        html = fetch_html(args.input, quiet=args.quiet)
+        html = fetch_html(src, quiet=args.quiet)
 
-    # Optionally save the HTML we actually parsed
-    if args.save_html:
-        with open(args.save_html, "w", encoding="utf-8") as f:
-            f.write(html)
-        if not args.quiet:
-            print(f"Saved HTML to: {args.save_html}")
+    atbats_df, pitches_df, summary_df = parse_play_by_play(html, verbose=(not args.quiet))
 
-    # Parse
-    atbats, pitch_rows, changes = parse_play_by_play(html, verbose=(not args.quiet))
-
-    # DataFrames
-    df_ab = pd.DataFrame([asdict(x) for x in atbats])
-    df_p = pd.DataFrame([asdict(x) for x in pitch_rows])
-    df_c = pd.DataFrame([asdict(x) for x in changes])
-
-    # Write Excel
-    out_path = args.output
-    if not out_path.lower().endswith(".xlsx"):
-        out_path += ".xlsx"
-
+    out_path = Path(args.output)
     if not args.quiet:
-        print(f"Writing Excel: {out_path}")
+        print(f"Writing Excel → {out_path.resolve()}")
+
+    # Ensure openpyxl exists (friendly msg if not)
+    try:
+        import openpyxl  # noqa: F401
+    except Exception:
+        print("openpyxl is required for Excel output. Install with:\n  uv tool install --with openpyxl pandas\nor\n  pip install openpyxl", file=sys.stderr)
+        sys.exit(1)
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
-        # Keep friendly column order
-        if not df_ab.empty:
-            df_ab = df_ab[
-                ["inning", "half", "team", "pitcher", "description", "pitch_count", "pitch_sequence", "header_id", "body_id"]
-            ]
-        if not df_p.empty:
-            df_p = df_p[
-                ["inning", "half", "team", "pitcher", "description", "pitch_no", "pitch_result", "pitch_type", "mph", "header_id", "body_id"]
-            ]
-        if not df_c.empty:
-            df_c = df_c[["inning", "half", "new_pitcher", "old_pitcher", "description"]]
+        # Preserve useful column order
+        atbat_cols = ["seq","inning","half","batting_team","pitcher","description","away_score","home_score","pitch_count"]
+        pitch_cols  = ["atbat_seq","inning","half","batting_team","pitcher","pitch_no","result","pitch_type","mph","away_score","home_score","atbat_desc"]
+        summ_cols   = ["seq","inning","half","batting_team","pitcher","play","pitch_sequence","away_score","home_score"]
 
-        # Sort for readability
-        if not df_ab.empty:
-            df_ab.sort_values(by=["inning", "half"], inplace=True, ignore_index=True)
-        if not df_p.empty:
-            df_p.sort_values(by=["inning", "half", "pitch_no"], inplace=True, ignore_index=True)
-        if not df_c.empty:
-            df_c.sort_values(by=["inning", "half"], inplace=True, ignore_index=True)
+        if not atbats_df.empty:
+            atbats_df = atbats_df.reindex(columns=atbat_cols)
+        if not pitches_df.empty:
+            pitches_df = pitches_df.reindex(columns=pitch_cols)
+        if not summary_df.empty:
+            summary_df = summary_df.reindex(columns=summ_cols)
 
-        (df_ab if not df_ab.empty else pd.DataFrame()).to_excel(xw, sheet_name="AtBats", index=False)
-        (df_p if not df_p.empty else pd.DataFrame()).to_excel(xw, sheet_name="Pitches", index=False)
-        (df_c if not df_c.empty else pd.DataFrame()).to_excel(xw, sheet_name="PitchingChanges", index=False)
+        atbats_df.to_excel(xw, sheet_name="At-Bats", index=False)
+        pitches_df.to_excel(xw, sheet_name="Pitches", index=False)
+        summary_df.to_excel(xw, sheet_name="Summary", index=False)
 
     if not args.quiet:
         print("Done.")
-
 
 if __name__ == "__main__":
     main()
