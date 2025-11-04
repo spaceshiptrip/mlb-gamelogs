@@ -2,12 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-ESPN MLB Play-by-Play → Excel (ALL pitch tables)
-- If --render is used with an ESPN URL, launches Playwright (headless Chromium),
-  auto-expands EVERY AtBatAccordion, waits for pitch tables to load, then parses.
-- If --render is omitted, parses the given URL/file as-is (works only if all pitch tables are present).
-- Status logs like "Parsing Inning 3 (Top – TOR): ..." and "• Captured N pitch rows → P1: Ball, ..."
-- Outputs 3 sheets: AtBats, Pitches, GameSummary.
+ESPN MLB Play-by-Play → Excel (ALL pitch tables, robust to zero-pitch ABs)
+- With --render on a live ESPN URL, uses Playwright (headless Chromium) to:
+  * scroll the page to trigger lazy loads,
+  * expand EVERY at-bat accordion,
+  * wait for pitch tables,
+  * then parse everything.
+- Without --render, parses the given HTML/URL as-is.
+
+Console status:
+  Parsing Inning X (Top/Bottom – TEAM): <desc>
+    • Captured N pitch rows → P1: Ball, P2: Foul Ball, ...
+
+Outputs 3 sheets: AtBats, Pitches, GameSummary
 
 Deps: playwright, beautifulsoup4, lxml, requests, pandas, openpyxl
 """
@@ -56,7 +63,7 @@ def fetch_html_via_requests(url: str, quiet: bool = False) -> str:
         try:
             resp = sess.get(url, headers=DEFAULT_HEADERS, timeout=25)
             if resp.status_code == 403:
-                # try again with small tweaks
+                # retry with small header tweak
                 time.sleep(0.8 + attempt * 0.4)
                 resp = sess.get(
                     url,
@@ -90,10 +97,9 @@ def fetch_html(src: str, quiet: bool = False, save_html: Optional[str] = None, r
             page.set_default_timeout(30000)
             page.goto(src, wait_until="domcontentloaded")
 
-            # Some pbp pages lazy-load sections while scrolling – scroll to the bottom slowly
-            # to force-load all accordions.
+            # Scroll to trigger lazy content
             last_height = 0
-            for _ in range(8):
+            for _ in range(10):
                 page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
                 time.sleep(0.6)
                 h = page.evaluate("document.body.scrollHeight")
@@ -101,29 +107,25 @@ def fetch_html(src: str, quiet: bool = False, save_html: Optional[str] = None, r
                     break
                 last_height = h
 
-            # Expand ALL at-bat accordions (they are buttons with class .AtBatAccordion__header)
-            # We attempt multiple passes to catch chunks that load late.
-            for _ in range(3):
+            # Expand all at-bat accordions
+            for _ in range(4):
                 buttons = page.query_selector_all("button.AtBatAccordion__header, .AtBatAccordion > button")
                 for btn in buttons:
                     try:
                         expanded = btn.get_attribute("aria-expanded")
                         if expanded != "true":
                             btn.click()
-                            # Wait briefly for the body to appear
                             time.sleep(0.05)
                     except Exception:
                         pass
-                time.sleep(0.3)
+                time.sleep(0.35)
 
-            # After expanding, wait until most pitch tables are present (best-effort heuristic)
-            # This prevents racing on slower connections.
-            for _ in range(10):
+            # Wait until many PitchTables are present (best-effort heuristic)
+            for _ in range(12):
                 count = page.evaluate("document.querySelectorAll('div.Collapse.AtBatAccordion__body .PitchTable').length")
-                # break early if we have a decent number
                 if count and count > 20:
                     break
-                time.sleep(0.3)
+                time.sleep(0.35)
 
             html = page.content()
             browser.close()
@@ -140,7 +142,6 @@ def fetch_html(src: str, quiet: bool = False, save_html: Optional[str] = None, r
                 f.write(html)
         return html
 
-    # Local file
     if not quiet:
         print(f"Reading file: {src}")
     with open(src, "r", encoding="utf-8") as f:
@@ -174,7 +175,7 @@ def parse_game_header_teams(soup: BeautifulSoup) -> Tuple[Optional[str], Optiona
 
 # ---------- Inning context parsing ----------
 def nearest_inning_header_text(node: Tag) -> str:
-    # Check previous siblings
+    # 1) previous siblings
     sib = node.previous_sibling
     while isinstance(sib, Tag):
         txt = inner_text(sib)
@@ -186,7 +187,7 @@ def nearest_inning_header_text(node: Tag) -> str:
                 return t2
         sib = sib.previous_sibling
 
-    # Check ancestors direct child headers
+    # 2) ancestors’ direct child headers
     parent = node.parent
     while isinstance(parent, Tag):
         headers = parent.find_all(["h1", "h2", "h3", "header"], recursive=False)
@@ -329,7 +330,6 @@ def parse_all_pitches(soup: BeautifulSoup, body_to_atbat: Dict[str, str]) -> Tup
     pitch_map: Dict[str, List[dict]] = {}
     pitch_summary: Dict[str, str] = {}
 
-    # Note: after Playwright expansion, every body should contain .PitchTable
     bodies = soup.select("div.Collapse.AtBatAccordion__body")
     for body in bodies:
         body_id = body.get("id")
@@ -341,8 +341,8 @@ def parse_all_pitches(soup: BeautifulSoup, body_to_atbat: Dict[str, str]) -> Tup
             atbat_key = body_id[:-8]
 
         rows = parse_pitch_body(body)
-        if not rows:
-            continue
+        if rows is None:
+            rows = []
 
         key = atbat_key or body_id
         pitch_map.setdefault(key, [])
@@ -351,15 +351,29 @@ def parse_all_pitches(soup: BeautifulSoup, body_to_atbat: Dict[str, str]) -> Tup
             rr["atbat_key"] = key
             pitch_map[key].append(rr)
 
-    # Build summaries
-    for k, rows in pitch_map.items():
+        # Build per-body summary string
         seq = []
         for r in rows:
             tag = f'P{r["pitch_no"]}' if r["pitch_no"] is not None else "P?"
             lab = r["result"] or ""
             seq.append(f"{tag}: {lab}")
-        pitch_summary[k] = " • Captured {} pitch rows → ".format(len(rows)) + ", ".join(seq)
+        pitch_summary[key] = f"• Captured {len(rows)} pitch rows → " + ", ".join(seq) if seq else "• Captured 0 pitch rows"
+
     return pitch_map, pitch_summary
+
+def nearest_inning_context_for_li(li: Optional[Tag]) -> str:
+    if not isinstance(li, Tag):
+        return ""
+    # Prefer siblings up the list hierarchy to catch ESPN grouping
+    ctx = nearest_inning_header_text(li)
+    if ctx:
+        return ctx
+    ul_parent = li.find_parent(["ul", "ol"])
+    if ul_parent:
+        ctx = nearest_inning_header_text(ul_parent)
+        if ctx:
+            return ctx
+    return ""
 
 def parse_play_by_play(full_html: str, verbose: bool=False) -> Tuple[List[dict], List[dict], dict]:
     soup = BeautifulSoup(full_html, "lxml")
@@ -376,19 +390,22 @@ def parse_play_by_play(full_html: str, verbose: bool=False) -> Tuple[List[dict],
         home_score = info.get("home_score", "")
         body_id = info.get("body_id")
 
-        ctx_text = nearest_inning_header_text(li) if isinstance(li, Tag) else ""
+        ctx_text = nearest_inning_context_for_li(li)
         inning_num, half, team_name = parse_inning_half_team(ctx_text, away_team, home_team)
+
+        # Resolve pitch_sequence safely
+        seq = pitch_summary.get(atbat_key)
+        if not seq and body_id:
+            seq = pitch_summary.get(body_id)
+        if not seq:
+            seq = "• Captured 0 pitch rows"
 
         if verbose:
             ih = inning_num if inning_num is not None else "Unknown"
             hh = half or "Unknown"
             tt = team_name or "Unknown Team"
             print(f"Parsing Inning {ih} ({hh} – {tt}): {desc}")
-            seq = pitch_summary.get(atbat_key) or (pitch_summary.get(body_id) if body_id else "")
-            if seq:
-                print("  " + seq)
-            else:
-                print("  • Captured 0 pitch rows")
+            print("   " + seq)
 
         atbats.append({
             "atbat_key": atbat_key,
@@ -398,7 +415,7 @@ def parse_play_by_play(full_html: str, verbose: bool=False) -> Tuple[List[dict],
             "description": desc,
             "away_score": away_score,
             "home_score": home_score,
-            "pitch_sequence": (pitch_summary.get(atbat_key) or (pitch_summary.get(body_id) if body_id else "")).replace("• ", ""),
+            "pitch_sequence": seq.replace("• ", ""),  # store without bullet
         })
 
     pitch_rows: List[dict] = []
