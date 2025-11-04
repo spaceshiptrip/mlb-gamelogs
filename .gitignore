@@ -1,77 +1,24 @@
-# --------------------------
-# Python
-# --------------------------
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Distribution / packaging
-build/
-dist/
-.eggs/
-*.egg-info/
-*.egg
-
-# Byte-compiled / cache
-.cache/
-.pytest_cache/
-.mypy_cache/
-
-# --------------------------
-# Environments
-# --------------------------
-.venv/
-venv/
-.env
-.env.local
-.env.*
-.DS_Store
-
-# --------------------------
-# Playwright
-# --------------------------
-playwright-report/
-playwright/.cache/
-trace.zip
-
-# --------------------------
-# Logs & Output
-# --------------------------
-*.log
-*.tmp
-*.bak
-*.swp
-*.xlsx
-*.csv
-*.tsv
-*.json
-*.html
-*.htm
-
-# Debug / temp files
-debug.html
-tmp/
-output/
-__sandbox__/
-
-# --------------------------
-# Editors
-# --------------------------
-.vscode/
-.idea/
-*.code-workspace
-
-# --------------------------
-# macOS / Windows junk
-# --------------------------
-.DS_Store
-Thumbs.db
-ehthumbs.db
-
-.gmap/
-
-# build/output
-*.xlsx
-~.xlsx
+# --- Global ignores ---
 *.zip
+
+# Excel temp/lock files (never track)
+~$*.xlsx
+
+# Ignore ALL xlsx by default...
+*.xlsx
+# ...except anything under reports/
+!reports/
+!reports/**/*.xlsx
+
+# Ignore ALL html by default...
+*.html
+# ...except anything under proc_html/
+!proc_html/
+!proc_html/**/*.html
+
+# Local tools
 .gmap/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
